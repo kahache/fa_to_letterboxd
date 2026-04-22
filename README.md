@@ -23,7 +23,7 @@ The script requires **Python 3.11** and a few external libraries to handle scrap
 Clone this repository or download the script, then install the dependencies:
 
 ```bash
-pip install tls-client beautifulsoup4 lxml
+pip install -r requirements.txt
 ```
 
 ## 🚀 Usage

@@ -2,7 +2,7 @@
 """
 fa_to_letterboxd.py
 ───────────────────
-Scrapes the public ratings of a FilmAffinity user and exports them
+Scrapes public ratings of a FilmAffinity user and exports them
 as a CSV file compatible with Letterboxd's diary importer.
 """
 
@@ -18,9 +18,10 @@ from typing import Optional
 from urllib.parse import urlencode
 from datetime import datetime
 
-# Cambiamos a tls_client para evitar los errores de CFFI en macOS
+# Anti-bot library
 import tls_client
 from bs4 import BeautifulSoup
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data model
@@ -34,28 +35,30 @@ class MovieEntry:
     Rating10: Optional[str]
     WatchedDate: Optional[str]
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP
+# HTTP (Using tls_client to bypass headers/fingerprinting checks)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Iniciamos sesión imitando a Chrome 120
+# Initialize session mimicking Chrome 120
 SESSION = tls_client.Session(
     client_identifier="chrome_120",
     random_tls_extension_order=True
 )
 
 def _refresh_headers(lang: str = "en") -> None:
+    """Updates headers to look like a real browser."""
     SESSION.headers.update({
         "Accept-Language": f"en-US,en;q=0.9,{lang};q=0.8",
         "Referer": f"https://www.filmaffinity.com/{lang}/main.html"
     })
 
 def warm_up_session(lang: str = "en") -> None:
+    """Visits the homepage to establish a valid session/cookies."""
     _refresh_headers(lang)
     home = f"https://www.filmaffinity.com/{lang}/main.html"
-    print(f"  Warming up session (visiting homepage)…")
+    print("  Warming up session (visiting homepage)…")
     try:
-        # tls_client usa timeout_seconds en lugar de timeout
         resp = SESSION.get(home, timeout_seconds=15)
         if resp.status_code >= 400:
              print(f"  [!] Warm-up got HTTP {resp.status_code} (continuing anyway)")
@@ -66,10 +69,12 @@ def warm_up_session(lang: str = "en") -> None:
     except Exception as exc:
         print(f"  [!] Warm-up failed (continuing anyway): {exc}", file=sys.stderr)
 
+
 def fetch_page(url: str, retries: int = 5) -> Optional[BeautifulSoup]:
+    """Fetches a URL and returns a BeautifulSoup object with retries."""
     for attempt in range(1, retries + 1):
         try:
-            time.sleep(random.uniform(0.3, 0.8))
+            time.sleep(random.uniform(0.5, 1.2))
             resp = SESSION.get(url, timeout_seconds=20)
 
             if resp.status_code == 429:
@@ -94,8 +99,9 @@ def fetch_page(url: str, retries: int = 5) -> Optional[BeautifulSoup]:
 
     return None
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Resto de la lógica (Constants, Parsers, CSV, etc. sin cambios)
+# Parsing logic
 # ──────────────────────────────────────────────────────────────────────────────
 
 _YEAR_RE = re.compile(r"\((\d{4})\)")
@@ -106,19 +112,25 @@ _TV_KEYWORDS = (
 )
 
 def _is_tv(text: str) -> bool:
+    """Checks if a title represents a TV show based on keywords."""
     return any(kw.lower() in text.lower() for kw in _TV_KEYWORDS)
 
 def _parse_fa_date(raw: str) -> Optional[str]:
+    """Converts FilmAffinity relative dates (Today, 2 days ago) to ISO format."""
     today = date.today()
     text = re.sub(r"^Rated\s*", "", raw, flags=re.I).strip()
     if not text: return None
     if text.lower() == "today": return today.isoformat()
     if text.lower() == "yesterday": return (today - timedelta(days=1)).isoformat()
+    
     m = re.match(r"(\d+)\s+days?\s+ago", text, re.I)
     if m: return (today - timedelta(days=int(m.group(1)))).isoformat()
-    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+    
+    # Try different date formats based on site language
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%d/%m/%y"):
         try: return datetime.strptime(text, fmt).date().isoformat()
         except ValueError: pass
+        
     for fmt in ("%B %d", "%b %d"):
         try:
             parsed = datetime.strptime(text, fmt)
@@ -129,165 +141,197 @@ def _parse_fa_date(raw: str) -> Optional[str]:
         except ValueError: pass
     return None
 
-def _parse_grid(soup, skip_tv: bool) -> list[MovieEntry]:
+def _parse_list_view(soup, skip_tv: bool) -> list[MovieEntry]:
+    """Parses the 'List' view (chv=list), extracting Title, Year, and Directors."""
     entries = []
-    cards = [c for c in soup.find_all("div", class_="card") if "h-100" in c.get("class", [])]
-    for card in cards:
-        link = card.find("a", class_="card-body") or card.find("a", href=re.compile(r"/film\d+\.html"))
-        if not link: continue
-        title = (link.get("title") or link.get_text(strip=True)).strip()
-        if not title or (skip_tv and _is_tv(title)): continue
-        rat_div = card.find("div", class_="avgrat-box")
-        rating = rat_div.get_text(strip=True) if rat_div else None
-        if rating and not (rating.isdigit() and 1 <= int(rating) <= 10): rating = None
-        small = card.find("small")
-        watched_date = _parse_fa_date(small.get_text(strip=True)) if small else None
-        entries.append(MovieEntry(Title=title, Year=None, Directors=None, Rating10=rating, WatchedDate=watched_date))
-    return entries
-
-def _parse_list(soup, skip_tv: bool) -> list[MovieEntry]:
-    entries = []
-    rows = soup.find_all("div", class_=re.compile(r"user-ratings-row|rat-row|fa-user-rat-row"))
+    # FilmAffinity list view rows are typically 'rat-row' or containers of 'mc-title'
+    rows = soup.find_all("div", class_=re.compile(r"rat-row|user-ratings-row"))
+    
     if not rows:
-        rows = soup.find_all(class_="mc-title")
-        if rows: rows = [r.find_parent("div") for r in rows if r.find_parent("div")]
-    for row in rows:
-        title_link = row.find("a", href=re.compile(r"/film\d+\.html"))
-        if not title_link: continue
-        title = title_link.get_text(strip=True)
-        row_text = row.get_text(" ", strip=True)
-        if not title or (skip_tv and _is_tv(row_text)): continue
-        m = _YEAR_RE.search(row_text)
-        year = m.group(1) if m else None
-        dir_links = row.find_all("a", href=re.compile(r"stype=director|/director\.php"))
-        directors = ", ".join(a.get_text(strip=True) for a in dir_links) or None
-        rat_div = row.find("div", class_="avgrat-box")
-        rating = rat_div.get_text(strip=True) if rat_div else None
-        if rating and not (rating.isdigit() and 1 <= int(rating) <= 10): rating = None
-        small = row.find("small")
-        watched_date = _parse_fa_date(small.get_text(strip=True)) if small else None
-        entries.append(MovieEntry(Title=title, Year=year, Directors=directors, Rating10=rating, WatchedDate=watched_date))
-    return entries
+        # Fallback for different layouts
+        titles = soup.find_all("div", class_="mc-title")
+        rows = [t.find_parent("div", class_="movie-card") or t.find_parent("div") for t in titles]
 
-def parse_page(soup, skip_tv: bool) -> list[MovieEntry]:
-    entries = _parse_list(soup, skip_tv)
-    return entries if entries else _parse_grid(soup, skip_tv)
+    for row in rows:
+        if not row: continue
+        
+        # 1. Extract Title and Year
+        title_container = row.find("div", class_="mc-title")
+        if not title_container:
+            title_container = row.find("a", href=re.compile(r"/film\d+\.html"))
+        
+        if not title_container: continue
+        
+        full_text = title_container.get_text(" ", strip=True)
+        if skip_tv and _is_tv(full_text): continue
+        
+        # Link for the title
+        link_el = title_container.find("a") if hasattr(title_container, "find") else title_container
+        title = link_el.get_text(strip=True) if link_el else full_text
+        
+        # Year extraction
+        year_match = _YEAR_RE.search(full_text)
+        year = year_match.group(1) if year_match else None
+        
+        # 2. Extract Directors
+        dir_container = row.find("div", class_="mc-director")
+        if dir_container:
+            directors = ", ".join([a.get_text(strip=True) for a in dir_container.find_all("a")])
+        else:
+            # Alternative: links with director stype
+            dir_links = row.find_all("a", href=re.compile(r"stype=director|/director\.php"))
+            directors = ", ".join([a.get_text(strip=True) for a in dir_links])
+        
+        # 3. Extract Rating
+        # Class ur-iv-rat is standard for user ratings in list view
+        rat_el = row.find("div", class_=re.compile(r"ur-iv-rat|avgrat-box"))
+        rating = rat_el.get_text(strip=True) if rat_el else None
+        if rating and not (rating.isdigit() and 1 <= int(rating) <= 10):
+            rating = None
+            
+        # 4. Extract Watched Date
+        date_el = row.find("div", class_="main-title-last") or row.find("small")
+        watched_date = None
+        if date_el:
+            watched_date = _parse_fa_date(date_el.get_text(strip=True))
+
+        entries.append(MovieEntry(
+            Title=title, 
+            Year=year, 
+            Directors=directors if directors else None, 
+            Rating10=rating, 
+            WatchedDate=watched_date
+        ))
+    return entries
 
 def get_total_pages(soup) -> int:
+    """Determines total number of pages from pagination links or total count."""
+    # Method A: Check pagination links
+    page_links = soup.find_all("a", href=re.compile(r"[?&]p=\d+"))
+    page_nums = []
+    for a in page_links:
+        m = re.search(r"[?&]p=(\d+)", a["href"])
+        if m: page_nums.append(int(m.group(1)))
+    
+    if page_nums:
+        return max(page_nums)
+        
+    # Method B: Parse the total count text (e.g., "1,500 ratings")
     for cls in ("tit-count-ratings", "count-ratings", "user-ratings-header", "header-count", "count"):
         el = soup.find(class_=cls)
         if el:
-            nums = re.findall(r"\d+", el.get_text())
-            if nums: return max(1, (int(nums[0]) + 49) // 50)
-    page_nums = [int(m.group(1)) for a in soup.find_all("a", href=re.compile(r"[?&]p=\d+")) if (m := re.search(r"[?&]p=(\d+)", a["href"]))]
-    if page_nums: return max(page_nums)
-    cards = [c for c in soup.find_all("div", class_="card") if "h-100" in c.get("class", [])]
-    return 999 if len(cards) == 50 else 1
+            # Clean thousands separators
+            clean_text = el.get_text().replace(",", "").replace(".", "")
+            nums = re.findall(r"\d+", clean_text)
+            if nums: 
+                total_items = int(nums[0])
+                return (total_items + 49) // 50
+                
+    return 1
 
-def build_url(user_id: str, page: int, lang: str, view: str = "grid") -> str:
-    params = urlencode({"user_id": user_id, "p": page, "orderby": "rating-date", "chv": view})
+def build_url(user_id: str, page: int, lang: str, view: str = "list") -> str:
+    """Constructs the FilmAffinity user ratings URL."""
+    params = urlencode({
+        "user_id": user_id, 
+        "p": page, 
+        "orderby": "rating-date", 
+        "chv": view
+    })
     return f"https://www.filmaffinity.com/{lang}/userratings.php?{params}"
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Output & Main Loop
+# ──────────────────────────────────────────────────────────────────────────────
+
 def write_csv(entries: list[MovieEntry], output_path: str) -> None:
+    """Writes the results to a Letterboxd-compatible CSV file."""
     col_names = [f.name for f in fields(MovieEntry)]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=col_names, quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()
         for e in entries:
-            writer.writerow({"Title": e.Title, "Year": e.Year or "", "Directors": e.Directors or "", "Rating10": e.Rating10 or "", "WatchedDate": e.WatchedDate or ""})
-
-def dump_debug(soup, page: int) -> None:
-    fname = f"fa_debug_page{page}.html"
-    with open(fname, "w", encoding="utf-8") as f: f.write(str(soup))
-    print(f"  [DEBUG] HTML saved → {fname}")
-    cards = [c for c in soup.find_all("div", class_="card") if "h-100" in c.get("class", [])]
-    print(f"  [DEBUG] div.card.h-100 found: {len(cards)}")
+            writer.writerow({
+                "Title": e.Title, 
+                "Year": e.Year or "", 
+                "Directors": e.Directors or "", 
+                "Rating10": e.Rating10 or "", 
+                "WatchedDate": e.WatchedDate or ""
+            })
 
 def scrape(user_id: str, lang: str, skip_tv: bool, output: str, debug: bool = False) -> None:
-    print("FilmAffinity → Letterboxd scraper (Powered by tls_client)")
+    """Main scraping orchestrator."""
+    print("FilmAffinity → Letterboxd scraper (Optimized for List View)")
     print(f"  User ID : {user_id}\n  Language: {lang}\n  Skip TV : {skip_tv}\n  Output  : {output}")
     if debug: print("  [DEBUG mode ON]")
     print()
 
     warm_up_session(lang)
 
-    first_url = build_url(user_id, 1, lang, "grid")
-    print(f"[1/?] {first_url}")
+    # Force 'list' view to get Year and Director
+    first_url = build_url(user_id, 1, lang, "list")
+    print(f"[Page 1/?] {first_url}")
     soup = fetch_page(first_url)
 
     if soup is None:
-        print("ERROR: Could not fetch page 1. Check the user ID and make sure the profile is public.", file=sys.stderr)
+        print("ERROR: Could not fetch page 1. Check user ID and privacy settings.", file=sys.stderr)
         sys.exit(1)
 
     total_pages = get_total_pages(soup)
-    known_total = total_pages != 999
-    display_total = str(total_pages) if known_total else "?"
-    print(f"  Detected {display_total} page(s).\n")
+    print(f"  Detected {total_pages} page(s).\n")
 
     all_entries: list[MovieEntry] = []
-    page = 1
     
-    while True:
+    for page in range(1, total_pages + 1):
         if page == 1:
             current_soup = soup
         else:
-            url = build_url(user_id, page, lang, "grid")
-            print(f"[{page}/{display_total}] {url}")
+            url = build_url(user_id, page, lang, "list")
+            print(f"[Page {page}/{total_pages}] {url}")
             current_soup = fetch_page(url)
             if current_soup is None:
-                print(f"  [!] Skipping page {page}.", file=sys.stderr)
-                page += 1
+                print(f"  [!] Failed to fetch page {page}. Skipping.", file=sys.stderr)
                 continue
 
-        if debug and page <= 2: dump_debug(current_soup, page)
+        if debug and page == 1:
+            with open("debug_page_1.html", "w", encoding="utf-8") as f:
+                f.write(str(current_soup))
 
-        entries = parse_page(current_soup, skip_tv)
-
-        if not entries:
-            if page > 1:
-                print(f"  → 0 entries on page {page}, stopping pagination.")
-                break
-            if not debug:
-                print(f"  [!] 0 entries on page 1 — re-run with --debug", file=sys.stderr)
-
+        entries = _parse_list_view(current_soup, skip_tv)
         all_entries.extend(entries)
-        print(f"  → {len(entries)} entries (total: {len(all_entries)})")
+        print(f"  → Found {len(entries)} movies (Total: {len(all_entries)})")
 
-        if known_total and page >= total_pages: break
-        if not known_total and len(entries) < 50: break
+        # Sleep to avoid detection
+        if page < total_pages:
+            time.sleep(random.uniform(2.5, 4.5))
 
-        page += 1
-        time.sleep(random.uniform(3.0, 6.0))
-
-    seen: set[tuple] = set()
-    unique: list[MovieEntry] = []
+    # Deduplicate based on title and year
+    seen = set()
+    unique = []
     for e in all_entries:
         key = (e.Title.lower(), e.Year)
         if key not in seen:
             seen.add(key)
             unique.append(e)
-    dupes = len(all_entries) - len(unique)
-
+    
     write_csv(unique, output)
 
-    print()
-    print("─" * 50)
+    print("\n" + "─" * 50)
     print("✓  Done!")
-    print(f"   Entries exported  : {len(unique)}")
-    print(f"   With rating       : {sum(1 for e in unique if e.Rating10)}")
-    print(f"   With watch date   : {sum(1 for e in unique if e.WatchedDate)}")
-    print(f"   With year         : {sum(1 for e in unique if e.Year)}")
-    if dupes: print(f"   Duplicates removed: {dupes}")
-    print(f"   Output            : {output}\n\nNext → https://letterboxd.com/import/")
+    print(f"   Movies exported   : {len(unique)}")
+    print(f"   With Year/Director: {sum(1 for e in unique if e.Year)}")
+    print(f"   Output file       : {output}")
+    print("Next step → Upload to https://letterboxd.com/import/")
 
 def main():
-    parser = argparse.ArgumentParser(description="Export FilmAffinity user ratings to a Letterboxd-compatible CSV.", formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("user_id", help="Your numeric FilmAffinity user ID")
-    parser.add_argument("--output", "-o", default="filmaffinity_export.csv", help="Output CSV file name")
-    parser.add_argument("--lang", default="en", choices=["en", "es"], help="FA language version")
-    parser.add_argument("--include-tv", dest="skip_tv", action="store_false", default=True, help="Include TV series")
-    parser.add_argument("--debug", action="store_true", default=False, help="Save raw HTML")
+    parser = argparse.ArgumentParser(description="Export FilmAffinity ratings to Letterboxd CSV.")
+    parser.add_argument("user_id", help="Numeric FilmAffinity user ID")
+    parser.add_argument("--output", "-o", default="filmaffinity_export.csv", help="CSV filename")
+    parser.add_argument("--lang", default="en", choices=["en", "es"], help="Site language (en is better for matching)")
+    parser.add_argument("--include-tv", dest="skip_tv", action="store_false", default=True, help="Include TV shows")
+    parser.add_argument("--debug", action="store_true", default=False, help="Save debug HTML")
     args = parser.parse_args()
+    
     scrape(user_id=args.user_id, lang=args.lang, skip_tv=args.skip_tv, output=args.output, debug=args.debug)
 
 if __name__ == "__main__":

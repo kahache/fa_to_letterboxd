@@ -18,6 +18,36 @@ The script requires **Python 3.11** and a few external libraries to handle scrap
 2.  **beautifulsoup4**: For parsing the HTML content.
 3.  **lxml**: A fast HTML parser for BeautifulSoup.
 
+## 📦 Choose Your Version
+
+This repository offers two ways to run the tool:
+
+### 1. The Unified Script (Easy Mode)
+Perfect for casual users. A single `.py` file containing everything. No folders, no complexity.
+- **Location**: `fa_to_letterboxd.py`
+- **Usage**: Just download the file and run `python fa_to_letterboxd.py [ID]`
+
+### 2. The Source Code (Developer Mode)
+The professional, modular version of the tool. Use this if you want to run tests, contribute, or understand the logic.
+- **Location**: `src/` and `tests/` folders.
+- **Entry Point**: `main.py`
+- **Usage**: `python main.py [ID]`
+
+## 🔍 How to find your FilmAffinity User ID
+
+To use this script, you need your unique numeric User ID. Follow these steps:
+
+1.  **Log in** to your FilmAffinity account.
+2.  Click on **"My Ratings"** (or "Mis votaciones") in the side menu.
+3.  Look at the **URL** in your browser's address bar.
+4.  Your User ID is the number at the end of the URL.
+
+**Example:**
+If your URL is `https://www.filmaffinity.com/en/userratings.php?user_id=760411`
+Your User ID is: **`760411`**
+
+> ⚠️ **Note:** Ensure your profile is set to **Public** in your account settings, otherwise the scraper will not be able to access your ratings
+
 ### Installation
 
 Clone this repository or download the script, then install the dependencies:
